@@ -1,6 +1,7 @@
 package screens
 
 import (
+	"regexp"
 	"strings"
 	"time"
 
@@ -28,6 +29,9 @@ type Logcat struct {
 
 	filterForm components.FormModal
 	toast      components.Toast
+
+	lastFiltered []string
+	regexErr     error
 }
 
 func NewLogcat(state *state.AppState) *Logcat {
@@ -119,6 +123,11 @@ func (l *Logcat) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return l, cmd
 
 	case tea.KeyMsg:
+		if msg.String() == "ctrl+r" {
+			l.search.Regex = !l.search.Regex
+			return l, consumeKeyCmd()
+		}
+
 		if l.search.Active {
 			l.search.HandleKey(msg)
 			return l, consumeKeyCmd()
@@ -218,11 +227,20 @@ func (l *Logcat) View() string {
 	maxWidth := max(l.state.Width-8, 20)
 	truncStyle := lipgloss.NewStyle().MaxWidth(maxWidth)
 
+	var re *regexp.Regexp
+	if l.search.Query != "" && l.search.Regex {
+		re, _ = regexp.Compile("(?i:" + l.search.Query + ")")
+	}
+
 	var body strings.Builder
 	for _, line := range filtered {
 		styled := colorLogLine(line)
 		if l.search.Query != "" {
-			styled = highlightSearch(styled, l.search.Query)
+			if l.search.Regex && re != nil {
+				styled = highlightSearchRegex(line, re)
+			} else if !l.search.Regex {
+				styled = highlightSearch(styled, l.search.Query)
+			}
 		}
 		body.WriteString(truncStyle.Render(styled) + "\n")
 	}
@@ -252,12 +270,25 @@ func (l *Logcat) View() string {
 		}
 	}
 
+	searchLabel := "search: "
+	if l.search.Regex {
+		searchLabel = "search (regex): "
+	}
+
 	if l.search.Active {
 		statusLine.WriteString("  ")
-		statusLine.WriteString(components.HelpKeyStyle.Render("search: ") + l.search.Query + "▌")
+		statusLine.WriteString(components.HelpKeyStyle.Render(searchLabel) + l.search.Query + "▌")
+		if l.regexErr != nil {
+			statusLine.WriteString("  ")
+			statusLine.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000")).Render("(" + l.regexErr.Error() + ")"))
+		}
 	} else if l.search.Query != "" {
 		statusLine.WriteString("  ")
-		statusLine.WriteString(components.StatusMuted.Render("search: \"" + l.search.Query + "\""))
+		statusLine.WriteString(components.StatusMuted.Render(searchLabel + "\"" + l.search.Query + "\""))
+		if l.regexErr != nil {
+			statusLine.WriteString("  ")
+			statusLine.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000")).Render("(" + l.regexErr.Error() + ")"))
+		}
 	}
 
 	if l.pidFilter != "" {
@@ -277,6 +308,7 @@ func (l *Logcat) View() string {
 			[2]string{"←/→", "level"},
 			[2]string{"p", "pid filter"},
 			[2]string{"/", "search"},
+			[2]string{"ctrl+r", "regex"},
 			[2]string{"w", "save"},
 			[2]string{"esc", "back"},
 		),
@@ -297,25 +329,73 @@ func (l *Logcat) View() string {
 /* ---------- helpers ---------- */
 
 func (l *Logcat) filteredLines() []string {
-	minLevel := logLevels[l.filterLevel]
-	if minLevel == "" && l.search.Query == "" {
-		return l.lines
+	if len(l.lines) == 0 {
+		l.lastFiltered = nil
+		l.regexErr = nil
+		return nil
 	}
 
-	result := make([]string, 0, len(l.lines))
-	for _, line := range l.lines {
-		if minLevel != "" && !lineMatchesLevel(line, minLevel) {
-			continue
+	minLevel := logLevels[l.filterLevel]
+	if l.search.Query == "" {
+		l.regexErr = nil
+		result := make([]string, 0, len(l.lines))
+		for _, line := range l.lines {
+			if minLevel != "" && !lineMatchesLevel(line, minLevel) {
+				continue
+			}
+			result = append(result, line)
 		}
-		if l.search.Query != "" && !strings.Contains(
-			strings.ToLower(line),
-			strings.ToLower(l.search.Query),
-		) {
-			continue
-		}
-		result = append(result, line)
+		l.lastFiltered = result
+		return result
 	}
-	return result
+
+	if l.search.Regex {
+		re, err := regexp.Compile("(?i:" + l.search.Query + ")")
+		if err != nil {
+			l.regexErr = err
+			if len(l.lastFiltered) > 0 {
+				return l.lastFiltered
+			}
+			result := make([]string, 0, len(l.lines))
+			for _, line := range l.lines {
+				if minLevel != "" && !lineMatchesLevel(line, minLevel) {
+					continue
+				}
+				result = append(result, line)
+			}
+			return result
+		}
+		l.regexErr = nil
+
+		result := make([]string, 0, len(l.lines))
+		for _, line := range l.lines {
+			if minLevel != "" && !lineMatchesLevel(line, minLevel) {
+				continue
+			}
+			if re.MatchString(line) {
+				result = append(result, line)
+			}
+		}
+		l.lastFiltered = result
+		return result
+	} else {
+		l.regexErr = nil
+		result := make([]string, 0, len(l.lines))
+		for _, line := range l.lines {
+			if minLevel != "" && !lineMatchesLevel(line, minLevel) {
+				continue
+			}
+			if !strings.Contains(
+				strings.ToLower(line),
+				strings.ToLower(l.search.Query),
+			) {
+				continue
+			}
+			result = append(result, line)
+		}
+		l.lastFiltered = result
+		return result
+	}
 }
 
 func lineMatchesLevel(line, minLevel string) bool {
@@ -357,23 +437,42 @@ func priorityRank(level string) int {
 	return -1
 }
 
-func colorLogLine(line string) string {
+func highlightSearchRegex(line string, re *regexp.Regexp) string {
+	loc := re.FindStringIndex(line)
+	if loc == nil || loc[0] == loc[1] {
+		return colorLogLine(line)
+	}
+
+	before := line[:loc[0]]
+	match := line[loc[0]:loc[1]]
+	after := line[loc[1]:]
+
+	style := getLogLineStyle(line)
+
+	return style.Render(before) + components.WarningStyle.Render(match) + style.Render(after)
+}
+
+func getLogLineStyle(line string) lipgloss.Style {
 	p := extractPriority(line)
 	switch p {
 	case "V":
-		return components.LogVerbose.Render(line)
+		return components.LogVerbose
 	case "D":
-		return components.LogDebug.Render(line)
+		return components.LogDebug
 	case "I":
-		return components.LogInfo.Render(line)
+		return components.LogInfo
 	case "W":
-		return components.LogWarn.Render(line)
+		return components.LogWarn
 	case "E":
-		return components.LogError.Render(line)
+		return components.LogError
 	case "F":
-		return components.LogFatal.Render(line)
+		return components.LogFatal
 	}
-	return line
+	return lipgloss.NewStyle()
+}
+
+func colorLogLine(line string) string {
+	return getLogLineStyle(line).Render(line)
 }
 
 func (l *Logcat) Cleanup() tea.Cmd {
